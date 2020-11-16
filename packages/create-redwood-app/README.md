@@ -1,5 +1,7 @@
 # create-redwood-app
 
+Creates a new Redwood project.
+
 <!-- toc -->
 - [Purpose and Vision](#Purpose-and-Vision)
 - [Package Lead](#Package-Lead)
