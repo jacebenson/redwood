@@ -366,11 +366,27 @@ export const deleteFilesTask = (files) => {
 
 /**
  * @param files - {[filepath]: contents}
+ * Deletes any empty directrories that are more than three levels deep below the base directory
+ * i.e. any directory below /web/src/components
  */
 export const cleanupEmptyDirsTask = (files) => {
   const { base } = getPaths()
-  const allDirs = Object.keys(files).map((file) => path.dirname(file))
-  const uniqueDirs = [...new Set(allDirs)]
+  const endDirs = Object.keys(files).map((file) => path.dirname(file))
+  const uniqueEndDirs = [...new Set(endDirs)]
+  // get the additional path directories not at the end of the path
+  const pathDirs = []
+  uniqueEndDirs.forEach((dir) => {
+    const relDir = path.relative(base, dir)
+    const splitDir = relDir.split(path.sep)
+    splitDir.pop()
+    while (splitDir.length > 3) {
+      const subDir = path.join(base, splitDir.join('/'))
+      pathDirs.push(subDir)
+      splitDir.pop()
+    }
+  })
+  const uniqueDirs = uniqueEndDirs.concat([...new Set(pathDirs)])
+
   return new Listr(
     uniqueDirs.map((dir) => {
       return {
@@ -407,18 +423,38 @@ const wrapWithSet = (routesContent, layout, routes, newLineAndIndent) => {
 export const addRoutesToRouterTask = (routes, layout) => {
   const redwoodPaths = getPaths()
   const routesContent = readFile(redwoodPaths.web.routes).toString()
-  const newRoutes = routes.filter((route) => !routesContent.includes(route))
-  const [routerStart, newLineAndIndent] = routesContent.match(/<Router>(\s*)/)
-  const routesBatch = layout
-    ? wrapWithSet(routesContent, layout, newRoutes, newLineAndIndent)
-    : newRoutes.join(newLineAndIndent)
-  const newRoutesContent = routesContent.replace(
-    routerStart,
-    `${routerStart + routesBatch + newLineAndIndent}`
+  const newRoutes = routes.filter((route) => !routesContent.match(route))
+
+  if (newRoutes.length) {
+    const [routerStart, newLineAndIndent] = routesContent.match(/<Router>(\s*)/)
+    const routesBatch = layout
+      ? wrapWithSet(routesContent, layout, newRoutes, newLineAndIndent)
+      : newRoutes.join(newLineAndIndent)
+    const newRoutesContent = routesContent.replace(
+      routerStart,
+      `${routerStart + routesBatch + newLineAndIndent}`
+    )
+    writeFile(redwoodPaths.web.routes, newRoutesContent, {
+      overwriteExisting: true,
+    })
+  }
+}
+
+export const addScaffoldImport = () => {
+  const appJsPath = getPaths().web.app
+  let appJsContents = readFile(appJsPath).toString()
+
+  if (appJsContents.match('./scaffold.css')) {
+    return 'Skipping scaffold style include'
+  }
+
+  appJsContents = appJsContents.replace(
+    "import Routes from 'src/Routes'\n",
+    "import Routes from 'src/Routes'\n\nimport './scaffold.css'"
   )
-  writeFile(redwoodPaths.web.routes, newRoutesContent, {
-    overwriteExisting: true,
-  })
+  writeFile(appJsPath, appJsContents, { overwriteExisting: true })
+
+  return 'Added scaffold import to App.{js,tsx}'
 }
 
 const removeEmtpySet = (routesContent, layout) => {

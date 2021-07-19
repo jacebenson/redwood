@@ -1,4 +1,9 @@
-const packageJSON = require('./package.json')
+const path = require('path')
+
+const packageJSON = require(path.join(
+  __dirname,
+  'tasks/framework-tools/package.json'
+))
 
 // RedwoodJS targets Node.js 12.x because this is the default version
 // for Netlify's functions.
@@ -74,9 +79,10 @@ module.exports = {
     {
       test: [
         './packages/auth/',
-        './packages/router',
+        './packages/router/',
         './packages/forms/',
         './packages/web/',
+        './packages/history/',
       ],
       presets: [
         [

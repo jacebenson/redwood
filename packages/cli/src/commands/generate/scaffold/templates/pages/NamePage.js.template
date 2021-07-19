@@ -1,7 +1,0 @@
-import ${singularPascalName}Cell from 'src/components/${pascalScaffoldPath}${singularPascalName}Cell'
-
-const ${singularPascalName}Page = ({ id }) => {
-  return <${singularPascalName}Cell id={id} />
-}
-
-export default ${singularPascalName}Page

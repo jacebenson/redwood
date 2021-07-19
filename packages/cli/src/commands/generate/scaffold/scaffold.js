@@ -11,6 +11,7 @@ import terminalLink from 'terminal-link'
 
 import { getConfig } from '@redwoodjs/internal'
 
+import { transformTSToJS } from 'src/lib'
 import {
   generateTemplate,
   templateRoot,
@@ -22,11 +23,17 @@ import {
   getPaths,
   writeFilesTask,
   addRoutesToRouterTask,
+  addScaffoldImport,
 } from 'src/lib'
 import c from 'src/lib/colors'
 
 import { yargsDefaults } from '../../generate'
-import { relationsForModel, intForeignKeysForModel } from '../helpers'
+import { handler as dbAuthHandler } from '../dbAuth/dbAuth'
+import {
+  relationsForModel,
+  intForeignKeysForModel,
+  ensureUniquePlural,
+} from '../helpers'
 import { files as sdlFiles, builder as sdlBuilder } from '../sdl/sdl'
 import {
   files as serviceFiles,
@@ -34,19 +41,6 @@ import {
 } from '../service/service'
 
 const NON_EDITABLE_COLUMNS = ['id', 'createdAt', 'updatedAt']
-const ASSETS = fs.readdirSync(
-  path.join(templateRoot, 'scaffold', 'templates', 'assets')
-)
-const LAYOUTS = fs.readdirSync(
-  path.join(templateRoot, 'scaffold', 'templates', 'layouts')
-)
-const PAGES = fs.readdirSync(
-  path.join(templateRoot, 'scaffold', 'templates', 'pages')
-)
-const COMPONENTS = fs.readdirSync(
-  path.join(templateRoot, 'scaffold', 'templates', 'components')
-)
-const SCAFFOLD_STYLE_PATH = './scaffold.css'
 // Any assets that should not trigger an overwrite error and require a --force
 const SKIPPABLE_ASSETS = ['scaffold.css']
 const PACKAGE_SET = 'Set'
@@ -55,15 +49,103 @@ const getIdType = (model) => {
   return model.fields.find((field) => field.isId)?.type
 }
 
+const getImportComponentNames = (
+  name,
+  scaffoldPath,
+  nestScaffoldByModel = true
+) => {
+  const pluralName = pascalcase(pluralize(name))
+  const singularName = pascalcase(pluralize.singular(name))
+  let componentPath
+  let layoutPath
+  if (scaffoldPath === '') {
+    componentPath = nestScaffoldByModel
+      ? `src/components/${singularName}`
+      : `src/components`
+    layoutPath = `src/layouts`
+  } else {
+    const sP = scaffoldPath.split('/').map(pascalcase).join('/')
+    componentPath = nestScaffoldByModel
+      ? `src/components/${sP}/${singularName}`
+      : `src/components/${sP}`
+    layoutPath = `src/layouts/${sP}`
+  }
+
+  return {
+    importComponentName: `${componentPath}/${singularName}`,
+    importComponentNameCell: `${componentPath}/${singularName}Cell`,
+    importComponentEditNameCell: `${componentPath}/Edit${singularName}Cell`,
+    importComponentNameForm: `${componentPath}/${singularName}Form`,
+    importComponentNewName: `${componentPath}/New${singularName}`,
+    importComponentNames: `${componentPath}/${pluralName}`,
+    importComponentNamesCell: `${componentPath}/${pluralName}Cell`,
+    importLayoutNames: `${layoutPath}/${pluralName}Layout`,
+  }
+}
+
+// Includes imports from getImportComponentNames()
+const getTemplateStrings = (name, scaffoldPath, nestScaffoldByModel = true) => {
+  const pluralPascalName = pascalcase(pluralize(name))
+  const singularPascalName = pascalcase(pluralize.singular(name))
+
+  const pluralCamelName = camelcase(pluralPascalName)
+  const singularCamelName = camelcase(singularPascalName)
+  const camelScaffoldPath = camelcase(pascalcase(scaffoldPath))
+
+  return {
+    pluralRouteName:
+      scaffoldPath === ''
+        ? pluralCamelName
+        : `${camelScaffoldPath}${pluralPascalName}`,
+
+    editRouteName:
+      scaffoldPath === ''
+        ? `edit${singularPascalName}`
+        : `${camelScaffoldPath}Edit${singularPascalName}`,
+
+    singularRouteName:
+      scaffoldPath === ''
+        ? singularCamelName
+        : `${camelScaffoldPath}${singularPascalName}`,
+
+    newRouteName:
+      scaffoldPath === ''
+        ? `new${singularPascalName}`
+        : `${camelScaffoldPath}New${singularPascalName}`,
+    ...getImportComponentNames(name, scaffoldPath, nestScaffoldByModel),
+  }
+}
+
 export const files = async ({
   model: name,
   path: scaffoldPath = '',
-  tests,
+  tests = true,
   typescript = false,
+  nestScaffoldByModel,
 }) => {
   const model = await getSchema(pascalcase(pluralize.singular(name)))
+  if (typeof nestScaffoldByModel === 'undefined') {
+    nestScaffoldByModel = getConfig().generate.nestScaffoldByModel
+  }
+  const templateStrings = getTemplateStrings(
+    name,
+    scaffoldPath,
+    nestScaffoldByModel
+  )
+  const pascalScaffoldPath =
+    scaffoldPath === ''
+      ? scaffoldPath
+      : scaffoldPath.split('/').map(pascalcase).join('/') + '/'
 
   return {
+    ...(await componentFiles(
+      name,
+      pascalScaffoldPath,
+      typescript,
+      nestScaffoldByModel,
+      templateStrings,
+      typescript
+    )),
     ...(await sdlFiles({
       ...getDefaultArgs(sdlBuilder),
       name,
@@ -79,16 +161,31 @@ export const files = async ({
       typescript,
     })),
     ...assetFiles(name),
-    ...layoutFiles(name, scaffoldPath, typescript),
-    ...pageFiles(name, scaffoldPath, typescript),
-    ...(await componentFiles(name, scaffoldPath, typescript)),
+    ...layoutFiles(
+      name,
+      pascalScaffoldPath,
+      typescript,
+      templateStrings,
+      typescript
+    ),
+    ...(await pageFiles(
+      name,
+      pascalScaffoldPath,
+      typescript,
+      nestScaffoldByModel,
+      templateStrings,
+      typescript
+    )),
   }
 }
 
 const assetFiles = (name) => {
   let fileList = {}
+  const assets = fs.readdirSync(
+    path.join(templateRoot, 'scaffold', 'templates', 'assets')
+  )
 
-  ASSETS.forEach((asset) => {
+  assets.forEach((asset) => {
     const outputAssetName = asset.replace(/\.template/, '')
     const outputPath = path.join(getPaths().web.src, outputAssetName)
 
@@ -110,32 +207,25 @@ const assetFiles = (name) => {
   return fileList
 }
 
-const layoutFiles = (name, scaffoldPath = '', generateTypescript) => {
+const layoutFiles = (
+  name,
+  pascalScaffoldPath = '',
+  generateTypescript,
+  templateStrings
+) => {
   const pluralName = pascalcase(pluralize(name))
   const singularName = pascalcase(pluralize.singular(name))
   let fileList = {}
 
-  const pascalScaffoldPath =
-    scaffoldPath === ''
-      ? scaffoldPath
-      : scaffoldPath.split('/').map(pascalcase).join('/') + '/'
+  const layouts = fs.readdirSync(
+    path.join(templateRoot, 'scaffold', 'templates', 'layouts')
+  )
 
-  const pluralCamelName = camelcase(pluralName)
-  const camelScaffoldPath = camelcase(pascalcase(scaffoldPath))
-
-  const pluralRouteName =
-    scaffoldPath === '' ? pluralCamelName : `${camelScaffoldPath}${pluralName}`
-
-  const newRouteName =
-    scaffoldPath === ''
-      ? `new${singularName}`
-      : `${camelScaffoldPath}New${singularName}`
-
-  LAYOUTS.forEach((layout) => {
+  layouts.forEach((layout) => {
     const outputLayoutName = layout
       .replace(/Names/, pluralName)
       .replace(/Name/, singularName)
-      .replace(/\.js\.template/, generateTypescript ? '.tsx' : '.js')
+      .replace(/\.tsx\.template/, generateTypescript ? '.tsx' : '.js')
 
     const outputPath = path.join(
       getPaths().web.layouts,
@@ -148,53 +238,78 @@ const layoutFiles = (name, scaffoldPath = '', generateTypescript) => {
       {
         name,
         pascalScaffoldPath,
-        pluralRouteName,
-        newRouteName,
+        ...templateStrings,
       }
     )
-    fileList[outputPath] = template
+
+    fileList[outputPath] = generateTypescript
+      ? template
+      : transformTSToJS(outputPath, template)
   })
 
   return fileList
 }
 
-const pageFiles = (name, scaffoldPath = '', generateTypescript) => {
+const pageFiles = async (
+  name,
+  pascalScaffoldPath = '',
+  generateTypescript,
+  nestScaffoldByModel = true,
+  templateStrings
+) => {
   const pluralName = pascalcase(pluralize(name))
   const singularName = pascalcase(pluralize.singular(name))
+  const model = await getSchema(singularName)
+  const idType = getIdType(model)
+
   let fileList = {}
 
-  const pascalScaffoldPath =
-    scaffoldPath === ''
-      ? scaffoldPath
-      : scaffoldPath.split('/').map(pascalcase).join('/') + '/'
+  const pages = fs.readdirSync(
+    path.join(templateRoot, 'scaffold', 'templates', 'pages')
+  )
 
-  PAGES.forEach((page) => {
+  pages.forEach((page) => {
     // Sanitize page names
     const outputPageName = page
       .replace(/Names/, pluralName)
       .replace(/Name/, singularName)
-      .replace(/\.js\.template/, generateTypescript ? '.tsx' : '.js')
+      .replace(/\.tsx\.template/, generateTypescript ? '.tsx' : '.js')
+
+    const finalFolder =
+      (nestScaffoldByModel ? singularName + '/' : '') +
+      outputPageName.replace(/\.(js|tsx?)/, '')
 
     const outputPath = path.join(
       getPaths().web.pages,
       pascalScaffoldPath,
-      outputPageName.replace(/\.(js|tsx?)/, ''),
+      finalFolder,
       outputPageName
     )
     const template = generateTemplate(
       path.join('scaffold', 'templates', 'pages', page),
       {
+        idType,
         name,
         pascalScaffoldPath,
+        ...templateStrings,
       }
     )
-    fileList[outputPath] = template
+
+    fileList[outputPath] = generateTypescript
+      ? template
+      : transformTSToJS(outputPath, template)
   })
 
   return fileList
 }
 
-const componentFiles = async (name, scaffoldPath = '', generateTypescript) => {
+const componentFiles = async (
+  name,
+  pascalScaffoldPath = '',
+  generateTypescript,
+  nestScaffoldByModel = true,
+  templateStrings
+) => {
   const pluralName = pascalcase(pluralize(name))
   const singularName = pascalcase(pluralize.singular(name))
   const model = await getSchema(singularName)
@@ -275,42 +390,28 @@ const componentFiles = async (name, scaffoldPath = '', generateTypescript) => {
     }, {})
   )
 
-  const pascalScaffoldPath =
-    scaffoldPath === ''
-      ? scaffoldPath
-      : scaffoldPath.split('/').map(pascalcase).join('/') + '/'
+  if (!fieldsToImport.length) {
+    throw new Error(`There are no editable fields in the ${name} model`)
+  }
 
-  const pluralCamelName = camelcase(pluralName)
-  const camelScaffoldPath = camelcase(pascalcase(scaffoldPath))
+  const components = fs.readdirSync(
+    path.join(templateRoot, 'scaffold', 'templates', 'components')
+  )
 
-  const pluralRouteName =
-    scaffoldPath === '' ? pluralCamelName : `${camelScaffoldPath}${pluralName}`
-
-  const editRouteName =
-    scaffoldPath === ''
-      ? `edit${singularName}`
-      : `${camelScaffoldPath}Edit${singularName}`
-
-  const singularRouteName =
-    scaffoldPath === ''
-      ? camelcase(singularName)
-      : `${camelScaffoldPath}${singularName}`
-
-  const newRouteName =
-    scaffoldPath === ''
-      ? `new${singularName}`
-      : `${camelScaffoldPath}New${singularName}`
-
-  await asyncForEach(COMPONENTS, (component) => {
+  await asyncForEach(components, (component) => {
     const outputComponentName = component
       .replace(/Names/, pluralName)
       .replace(/Name/, singularName)
-      .replace(/\.js\.template/, generateTypescript ? '.tsx' : '.js')
+      .replace(/\.tsx\.template/, generateTypescript ? '.tsx' : '.js')
+
+    const finalFolder =
+      (nestScaffoldByModel ? singularName + '/' : '') +
+      outputComponentName.replace(/\.(js|tsx?)/, '')
 
     const outputPath = path.join(
       getPaths().web.components,
       pascalScaffoldPath,
-      outputComponentName.replace(/\.(js|tsx?)/, ''),
+      finalFolder,
       outputComponentName
     )
 
@@ -324,24 +425,31 @@ const componentFiles = async (name, scaffoldPath = '', generateTypescript) => {
         idType,
         intForeignKeys,
         pascalScaffoldPath,
-        pluralRouteName,
-        editRouteName,
-        singularRouteName,
-        newRouteName,
+        ...templateStrings,
       }
     )
-    fileList[outputPath] = template
+
+    fileList[outputPath] = generateTypescript
+      ? template
+      : transformTSToJS(outputPath, template)
   })
 
   return fileList
 }
 
 // add routes for all pages
-export const routes = async ({ model: name, path: scaffoldPath = '' }) => {
+export const routes = async ({
+  model: name,
+  path: scaffoldPath = '',
+  nestScaffoldByModel,
+}) => {
+  if (typeof nestScaffoldByModel === 'undefined') {
+    nestScaffoldByModel = getConfig().generate.nestScaffoldByModel
+  }
+
+  const templateNames = getTemplateStrings(name, scaffoldPath)
   const singularPascalName = pascalcase(pluralize.singular(name))
   const pluralPascalName = pascalcase(pluralize(name))
-  const singularCamelName = camelcase(singularPascalName)
-  const pluralCamelName = camelcase(pluralPascalName)
   const pluralParamName = paramCase(pluralPascalName)
   const model = await getSchema(singularPascalName)
   const idRouteParam = getIdType(model) === 'Int' ? ':Int' : ''
@@ -351,39 +459,19 @@ export const routes = async ({ model: name, path: scaffoldPath = '' }) => {
       ? scaffoldPath
       : scaffoldPath.split('/').map(paramCase).join('/') + '/'
   const pascalScaffoldPath = pascalcase(scaffoldPath)
-  const camelScaffoldPath = camelcase(pascalScaffoldPath)
 
-  const newRouteName =
-    scaffoldPath === ''
-      ? `new${singularPascalName}`
-      : `${camelScaffoldPath}New${singularPascalName}`
-
-  const editRouteName =
-    scaffoldPath === ''
-      ? `edit${singularPascalName}`
-      : `${camelScaffoldPath}Edit${singularPascalName}`
-
-  const singularRouteName =
-    scaffoldPath === ''
-      ? singularCamelName
-      : `${camelScaffoldPath}${singularPascalName}`
-
-  const pluralRouteName =
-    scaffoldPath === ''
-      ? pluralCamelName
-      : `${camelScaffoldPath}${pluralPascalName}`
-
-  // TODO: These names look like they need changing
+  const pageRoot =
+    pascalScaffoldPath + (nestScaffoldByModel ? singularPascalName : '')
 
   return [
     // new
-    `<Route path="/${paramScaffoldPath}${pluralParamName}/new" page={${pascalScaffoldPath}New${singularPascalName}Page} name="${newRouteName}" />`,
+    `<Route path="/${paramScaffoldPath}${pluralParamName}/new" page={${pageRoot}New${singularPascalName}Page} name="${templateNames.newRouteName}" />`,
     // edit
-    `<Route path="/${paramScaffoldPath}${pluralParamName}/{id${idRouteParam}}/edit" page={${pascalScaffoldPath}Edit${singularPascalName}Page} name="${editRouteName}" />`,
+    `<Route path="/${paramScaffoldPath}${pluralParamName}/{id${idRouteParam}}/edit" page={${pageRoot}Edit${singularPascalName}Page} name="${templateNames.editRouteName}" />`,
     // singular
-    `<Route path="/${paramScaffoldPath}${pluralParamName}/{id${idRouteParam}}" page={${pascalScaffoldPath}${singularPascalName}Page} name="${singularRouteName}" />`,
+    `<Route path="/${paramScaffoldPath}${pluralParamName}/{id${idRouteParam}}" page={${pageRoot}${singularPascalName}Page} name="${templateNames.singularRouteName}" />`,
     // plural
-    `<Route path="/${paramScaffoldPath}${pluralParamName}" page={${pascalScaffoldPath}${pluralPascalName}Page} name="${pluralRouteName}" />`,
+    `<Route path="/${paramScaffoldPath}${pluralParamName}" page={${pageRoot}${pluralPascalName}Page} name="${templateNames.pluralRouteName}" />`,
   ]
 }
 
@@ -405,20 +493,29 @@ const addLayoutImport = ({ model: name, path: scaffoldPath = '' }) => {
   const routesContent = readFile(routesPath).toString()
 
   const newRoutesContent = routesContent.replace(
-    /'@redwoodjs\/router'(\s*)/,
-    `'@redwoodjs/router'$1${importLayout}$1`
+    /['"]@redwoodjs\/router['"](\s*)/,
+    `'@redwoodjs/router'\n${importLayout}$1`
   )
   writeFile(routesPath, newRoutesContent, { overwriteExisting: true })
 
   return 'Added layout import to Routes.{js,tsx}'
 }
 
-const addSetImport = () => {
+const addSetImport = (task) => {
   const routesPath = getPaths().web.routes
   const routesContent = readFile(routesPath).toString()
   const [redwoodRouterImport, importStart, spacing, importContent, importEnd] =
-    routesContent.match(/(import {)(\s*)([^]*)(} from '@redwoodjs\/router')/) ||
-    []
+    routesContent.match(
+      /(import {)(\s*)([^]*)(} from ['"]@redwoodjs\/router['"])/
+    ) || []
+
+  if (!redwoodRouterImport) {
+    task.skip(
+      "Couldn't add Set import from @redwoodjs/router to Routes.{js,tsx}"
+    )
+    return undefined
+  }
+
   const routerImports = importContent.replace(/\s/g, '').split(',')
   if (routerImports.includes(PACKAGE_SET)) {
     return 'Skipping Set import'
@@ -437,23 +534,6 @@ const addSetImport = () => {
   writeFile(routesPath, newRoutesContent, { overwriteExisting: true })
 
   return 'Added Set import to Routes.{js,tsx}'
-}
-
-const addScaffoldImport = () => {
-  const appJsPath = getPaths().web.app
-  let appJsContents = readFile(appJsPath).toString()
-
-  if (appJsContents.match(SCAFFOLD_STYLE_PATH)) {
-    return 'Skipping scaffold style include'
-  }
-
-  appJsContents = appJsContents.replace(
-    "import Routes from 'src/Routes'\n",
-    `import Routes from 'src/Routes'\n\nimport '${SCAFFOLD_STYLE_PATH}'`
-  )
-  writeFile(appJsPath, appJsContents, { overwriteExisting: true })
-
-  return 'Added scaffold import to App.{js,tsx}'
 }
 
 export const command = 'scaffold <model>'
@@ -487,7 +567,13 @@ const tasks = ({ model, path, force, tests, typescript, javascript }) => {
       {
         title: 'Generating scaffold files...',
         task: async () => {
-          const f = await files({ model, path, tests, typescript, javascript })
+          const f = await files({
+            model,
+            path,
+            tests,
+            typescript,
+            javascript,
+          })
           return writeFilesTask(f, { overwriteExisting: force })
         },
       },
@@ -497,7 +583,7 @@ const tasks = ({ model, path, force, tests, typescript, javascript }) => {
       },
       {
         title: 'Adding set import...',
-        task: async () => addSetImport({ model, path }),
+        task: async (_, task) => addSetImport(task),
       },
       {
         title: 'Adding scaffold routes...',
@@ -518,16 +604,23 @@ export const handler = async ({
   tests,
   typescript,
 }) => {
+  if (modelArg.toLowerCase() === 'dbauth') {
+    // proxy to dbAuth generator
+    return await dbAuthHandler({ force, tests, typescript })
+  }
+
   if (tests === undefined) {
     tests = getConfig().generate.tests
   }
   const { model, path } = splitPathAndModel(modelArg)
-  const t = tasks({ model, path, force, tests, typescript })
+  await ensureUniquePlural({ model })
 
+  const t = tasks({ model, path, force, tests, typescript })
   try {
     await t.run()
   } catch (e) {
     console.log(c.error(e.message))
+    process.exit(e?.existCode || 1)
   }
 }
 

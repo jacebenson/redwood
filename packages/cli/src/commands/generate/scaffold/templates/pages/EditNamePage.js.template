@@ -1,7 +1,0 @@
-import Edit${singularPascalName}Cell from 'src/components/${pascalScaffoldPath}Edit${singularPascalName}Cell'
-
-const Edit${singularPascalName}Page = ({ id }) => {
-  return <Edit${singularPascalName}Cell id={id} />
-}
-
-export default Edit${singularPascalName}Page
